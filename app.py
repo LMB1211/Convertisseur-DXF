@@ -9,25 +9,30 @@ from skimage.morphology import skeletonize
 # --- CONFIGURATION DE LA PAGE ---
 st.set_page_config(page_title="Convertisseur Image vers DXF", layout="centered")
 
-# --- TITRE ET EXPLICATIONS ---
 st.title("🪄 Convertisseur Magique : Image ➡️ DXF")
-st.write("Bienvenue ! Glissez-déposez vos images (plans, croquis, photos) ci-dessous. Le système va détecter les lignes centrales et créer un fichier lisible par AutoCAD.")
+st.write("Glissez-déposez vos images (plans, croquis, PNG transparents). Le système détectera tous les détails intérieurs et extérieurs !")
 
-# --- OPTIONS SIMPLIFIÉES (Optionnelles mais utiles) ---
+# --- NOUVELLES OPTIONS ---
 st.write("---")
 col1, col2 = st.columns(2)
-with col1:
-    # Pour lisser les courbes "en escalier"
-    lissage = st.slider("Niveau de lissage des courbes", min_value=1.0, max_value=10.0, value=3.0, step=0.5, help="Plus la valeur est grande, plus les lignes droites et les courbes seront douces, mais vous perdrez un peu de détails fins.")
-with col2:
-    # Pour ignorer les petites poussières
-    taille_min = st.slider("Ignorer les petits points (pixels)", min_value=0, max_value=500, value=50, step=10, help="Supprime les petits artefacts ou la poussière sur l'image.")
-st.write("---")
 
+with col1:
+    # L'utilisateur peut maintenant choisir le type de trait AutoCAD
+    type_trace = st.radio(
+        "Type de tracé dans AutoCAD :",
+        options=["📐 Lignes brisées (Polyligne - Idéal plans)", "〰️ Vraies courbes (Spline - Idéal dessins)"],
+        index=0
+    )
+
+with col2:
+    # Les réglages précédents, toujours très utiles
+    lissage = st.slider("Simplification des traits", min_value=1.0, max_value=10.0, value=2.0, step=0.5, help="Réduit le nombre de points d'ancrage.")
+    taille_min = st.slider("Ignorer la poussière", min_value=0, max_value=500, value=50, step=10, help="Efface les micro-détails indésirables.")
+st.write("---")
 
 # --- ZONE DE TÉLÉCHARGEMENT ---
 fichiers_uploades = st.file_uploader(
-    "Déposez vos images ici (formats acceptés : JPG, PNG)", 
+    "Déposez vos images ici (JPG, PNG même transparents)", 
     type=['png', 'jpg', 'jpeg'], 
     accept_multiple_files=True
 )
@@ -35,15 +40,14 @@ fichiers_uploades = st.file_uploader(
 # --- TRAITEMENT DES IMAGES ---
 if fichiers_uploades:
     st.write("⏳ *Traitement en cours, veuillez patienter...*")
-    
     dxf_generes = {}
     barre_progression = st.progress(0)
     total_fichiers = len(fichiers_uploades)
 
     for index, fichier in enumerate(fichiers_uploades):
-        # 1. LIRE L'IMAGE
+        # 1. LIRE L'IMAGE (En gardant la transparence s'il y en a)
         bytes_data = np.asarray(bytearray(fichier.read()), dtype=np.uint8)
-        image = cv2.imdecode(bytes_data, cv2.IMREAD_COLOR)
+        image = cv2.imdecode(bytes_data, cv2.IMREAD_UNCHANGED) # UNCHANGED garde le canal Alpha (transparence)
         
         if image is None:
             st.error(f"Oups, impossible de lire l'image {fichier.name}.")
@@ -51,45 +55,60 @@ if fichiers_uploades:
             
         hauteur, largeur = image.shape[:2]
         
-        # 2. PRÉPARATION (Noir et Blanc strict)
-        gris = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        # 2. GESTION DE LA TRANSPARENCE (PNG)
+        # Si l'image a 4 canaux (Rouge, Vert, Bleu, et Alpha/Transparence)
+        if len(image.shape) == 3 and image.shape[2] == 4:
+            # On crée une feuille blanche de la même taille
+            fond_blanc = np.ones_like(image[:, :, :3], dtype=np.uint8) * 255
+            alpha = image[:, :, 3].astype(float) / 255.0
+            # On "colle" notre image sur la feuille blanche
+            for couleur in range(3):
+                fond_blanc[:, :, couleur] = image[:, :, couleur] * alpha + fond_blanc[:, :, couleur] * (1 - alpha)
+            image = fond_blanc # L'image n'a plus de transparence, elle a un fond blanc
+
+        # S'assurer qu'on a bien une image couleur ou nuance de gris classique
+        if len(image.shape) == 3:
+            gris = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gris = image
         
-        # On inverse souvent les couleurs car la squelettisation travaille sur le blanc (les traits à garder) 
-        # sur fond noir. On utilise un seuil automatique (Otsu) pour séparer parfaitement le trait du fond.
+        # 3. PRÉPARATION MATHÉMATIQUE
+        # On sépare fermement les traits noirs du fond blanc
         _, binaire = cv2.threshold(gris, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         
-        # 3. SQUELETTISATION (Le secret pour éviter les lignes doubles)
-        # On transforme l'image binaire (0 ou 255) en valeurs True/False (0 ou 1) pour l'algorithme
+        # 4. SQUELETTISATION (Évite les lignes doubles)
         image_bool = binaire > 0
-        # On ronge les traits jusqu'à 1 pixel d'épaisseur
         squelette = skeletonize(image_bool)
-        
-        # On repasse en format image (0 ou 255) pour OpenCV
         squelette_cv8u = (squelette * 255).astype(np.uint8)
         
-        # 4. EXTRACTION ET LISSAGE DES LIGNES
-        contours_maths, _ = cv2.findContours(squelette_cv8u, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # 5. EXTRACTION DES LIGNES (RETR_LIST prend tout, intérieur comme extérieur)
+        contours_maths, _ = cv2.findContours(squelette_cv8u, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         
-        # 5. CRÉATION DU FICHIER DXF
+        # 6. CRÉATION DU FICHIER DXF
         doc_dxf = ezdxf.new("R2010")
         espace_modele = doc_dxf.modelspace()
         
         for contour in contours_maths:
-            # On ignore les contours trop petits (la "poussière")
             if cv2.contourArea(contour) < taille_min and len(contour) < taille_min:
                 continue
                 
-            # LISSAGE : On simplifie le contour pour enlever l'effet "escalier" (Aliasing)
-            # L'algorithme de Douglas-Peucker (approxPolyDP) réduit le nombre de points d'une courbe
-            epsilon = lissage * cv2.arcLength(contour, True) / 1000.0 # Plus lissage est grand, plus on lisse
+            # On simplifie un peu le tracé selon le curseur
+            epsilon = lissage * cv2.arcLength(contour, True) / 1000.0
             contour_lisse = cv2.approxPolyDP(contour, epsilon, False)
 
             if len(contour_lisse) >= 2:
-                # On inverse la hauteur pour AutoCAD
-                points = [(point[0][0], hauteur - point[0][1]) for point in contour_lisse]
-                espace_modele.add_lwpolyline(points)
+                # Formatage des points pour AutoCAD (inversion de la hauteur)
+                points = [(float(point[0][0]), float(hauteur - point[0][1])) for point in contour_lisse]
                 
-        # 6. SAUVEGARDE EN MÉMOIRE
+                # --- LE CHOIX MAGIQUE : POLYLIGNE OU SPLINE ---
+                if "Courbes" in type_trace and len(points) >= 3:
+                    # On crée une vraie courbe (Spline) qui passe par ces points
+                    espace_modele.add_spline(fit_points=points)
+                else:
+                    # On crée des segments droits (Polyligne classique)
+                    espace_modele.add_lwpolyline(points)
+                
+        # 7. SAUVEGARDE EN MÉMOIRE
         flux_texte = io.StringIO()
         doc_dxf.write(flux_texte)
         
@@ -102,17 +121,14 @@ if fichiers_uploades:
     st.success("✅ Traitement terminé avec succès !")
 
     # --- TÉLÉCHARGEMENT ---
-    st.write("### 📥 Récupérez vos fichiers")
-    
     if len(dxf_generes) == 1:
         nom_fichier, contenu = list(dxf_generes.items())[0]
         st.download_button(
-            label=f"Télécharger {nom_fichier}",
+            label=f"📥 Télécharger {nom_fichier}",
             data=contenu,
             file_name=nom_fichier,
             mime="application/dxf"
         )
-        
     elif len(dxf_generes) > 1:
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as archive_zip:
@@ -120,7 +136,7 @@ if fichiers_uploades:
                 archive_zip.writestr(nom_fichier, contenu)
                 
         st.download_button(
-            label="Télécharger tous les DXF (Dossier ZIP)",
+            label="📥 Télécharger tous les DXF (Dossier ZIP)",
             data=zip_buffer.getvalue(),
             file_name="fichiers_convertis_dxf.zip",
             mime="application/zip"
