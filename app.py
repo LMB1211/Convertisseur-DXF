@@ -7,19 +7,28 @@ import zipfile
 from skimage.morphology import skeletonize
 
 # --- CONFIGURATION DE LA PAGE ---
-st.set_page_config(page_title="Convertisseur Image vers DXF", layout="centered")
+st.set_page_config(page_title="Convertisseur Image vers DXF", layout="wide")
 
 st.title("🪄 Convertisseur Magique : Image ➡️ DXF")
-st.write("Glissez-déposez vos images (plans, croquis, PNG transparents). Le système détectera tous les détails intérieurs et extérieurs !")
+st.write("Glissez-déposez vos images. Le système crée de vraies courbes AutoCAD sans lignes doubles !")
 
-# --- OPTIONS ---
+# --- OPTIONS DU PANNEAU DE CONTRÔLE ---
 st.write("---")
 col1, col2 = st.columns(2)
 
 with col1:
     type_trace = st.radio(
-        "Type de tracé dans AutoCAD :",
-        options=["📐 Lignes brisées (Polyligne - Idéal plans)", "〰️ Vraies courbes (Spline - Idéal dessins)"],
+        "1. Type de tracé dans AutoCAD :",
+        options=["〰️ Vraies courbes (Splines - Parfait pour les dessins)", "📐 Lignes brisées (Polylignes - Parfait pour les plans)"],
+        index=0
+    )
+    
+    mode_analyse = st.radio(
+        "2. Méthode d'analyse de l'image :",
+        options=[
+            "🎯 Trait central unique (Idéal Plans : force une ligne simple sans doublon)",
+            "⭕ Contours exacts (Idéal Dessins/Logos : garde l'épaisseur de votre coup de crayon)"
+        ],
         index=0
     )
 
@@ -43,7 +52,7 @@ if fichiers_uploades:
     total_fichiers = len(fichiers_uploades)
 
     for index, fichier in enumerate(fichiers_uploades):
-        # 1. LIRE L'IMAGE
+        # 1. LIRE L'IMAGE (Gère la transparence PNG)
         bytes_data = np.asarray(bytearray(fichier.read()), dtype=np.uint8)
         image = cv2.imdecode(bytes_data, cv2.IMREAD_UNCHANGED) 
         
@@ -52,7 +61,6 @@ if fichiers_uploades:
             
         hauteur, largeur = image.shape[:2]
         
-        # 2. GESTION DE LA TRANSPARENCE (PNG)
         if len(image.shape) == 3 and image.shape[2] == 4:
             fond_blanc = np.ones_like(image[:, :, :3], dtype=np.uint8) * 255
             alpha = image[:, :, 3].astype(float) / 255.0
@@ -65,61 +73,80 @@ if fichiers_uploades:
         else:
             gris = image
         
-        # 3. PRÉPARATION MATHÉMATIQUE
+        # 2. SEPARATION FOND / TRAIT
         _, binaire = cv2.threshold(gris, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         
-        # 4. SQUELETTISATION 
-        image_bool = binaire > 0
-        squelette = skeletonize(image_bool)
-        squelette_cv8u = (squelette * 255).astype(np.uint8)
+        # 3. CHOIX DU MODE D'ANALYSE
+        if "Trait central" in mode_analyse:
+            # Squelettisation pour réduire à 1 pixel
+            image_bool = binaire > 0
+            squelette = skeletonize(image_bool)
+            img_a_traiter = (squelette * 255).astype(np.uint8)
+            est_mode_squelette = True
+        else:
+            # On garde l'image telle quelle pour avoir l'épaisseur du trait
+            img_a_traiter = binaire
+            est_mode_squelette = False
         
-        # ON GARDE TOUS LES POINTS (CHAIN_APPROX_NONE) POUR FAIRE DE BELLES COURBES
-        contours_maths, _ = cv2.findContours(squelette_cv8u, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+        # Extraction brute des lignes
+        contours_maths, _ = cv2.findContours(img_a_traiter, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
         
-        # 5. CRÉATION DU FICHIER DXF
+        # 4. CRÉATION DU FICHIER DXF
         doc_dxf = ezdxf.new("R2010")
         espace_modele = doc_dxf.modelspace()
-        
-        est_mode_courbe = "Courbes" in type_trace
         
         for contour in contours_maths:
             if cv2.contourArea(contour) < taille_min and len(contour) < taille_min:
                 continue
-                
-            # L'ASTUCE EST ICI : 
-            if est_mode_courbe:
-                # Si on veut des courbes, on garde beaucoup de points (on divise l'epsilon par 5)
-                epsilon = (lissage / 5.0) * cv2.arcLength(contour, True) / 1000.0
-            else:
-                # Si on veut des traits droits, on simplifie normalement
-                epsilon = lissage * cv2.arcLength(contour, True) / 1000.0
-                
-            contour_lisse = cv2.approxPolyDP(contour, epsilon, False)
-
-            # Extraction des coordonnées pour AutoCAD
-            points = [(float(point[0][0]), float(hauteur - point[0][1])) for point in contour_lisse]
             
-            # --- CRÉATION DE LA LIGNE OU DE LA COURBE ---
+            # --- LE FILTRE ANTI-LIGNES DOUBLES ---
+            if est_mode_squelette:
+                # Si on est en trait central, on supprime le chemin de retour
+                points_uniques = []
+                pixels_vus = set()
+                for pt in contour:
+                    coord = (int(pt[0][0]), int(pt[0][1]))
+                    if coord not in pixels_vus:
+                        pixels_vus.add(coord)
+                        points_uniques.append([coord])
+                contour_propre = np.array(points_uniques, dtype=np.int32)
+                contour_ferme = False # Un trait central est ouvert
+            else:
+                # Si on est en contour exact, on garde la boucle complète
+                contour_propre = contour
+                contour_ferme = True
+
+            if len(contour_propre) < 2:
+                continue
+                
+            # Lissage de la courbe
+            if "Splines" in type_trace:
+                epsilon = (lissage / 5.0) * cv2.arcLength(contour_propre, contour_ferme) / 1000.0
+            else:
+                epsilon = lissage * cv2.arcLength(contour_propre, contour_ferme) / 1000.0
+                
+            contour_lisse = cv2.approxPolyDP(contour_propre, epsilon, contour_ferme)
+
+            # Préparation des points pour AutoCAD (Y inversé)
+            points = [(float(p[0][0]), float(hauteur - p[0][1])) for p in contour_lisse]
+            
+            # --- DESSIN DANS AUTOCAD ---
             if len(points) >= 2:
-                # Une vraie Spline a besoin d'au moins 4 points pour exister
-                if est_mode_courbe and len(points) >= 4:
+                if "Splines" in type_trace and len(points) >= 3:
                     try:
+                        # AutoCAD va enfin accepter nos Splines sans planter !
                         espace_modele.add_spline(fit_points=points)
                     except Exception:
-                        # Sécurité si la forme est trop bizarre mathématiquement
                         espace_modele.add_lwpolyline(points)
                 else:
-                    # Pour les tout petits traits (2 ou 3 points), on fait une polyligne
                     espace_modele.add_lwpolyline(points)
                 
-        # 6. SAUVEGARDE EN MÉMOIRE
+        # 5. SAUVEGARDE
         flux_texte = io.StringIO()
         doc_dxf.write(flux_texte)
-        
         nom_base = fichier.name.rsplit('.', 1)[0]
         nom_dxf = f"{nom_base}.dxf"
         dxf_generes[nom_dxf] = flux_texte.getvalue()
-        
         barre_progression.progress((index + 1) / total_fichiers)
 
     st.success("✅ Traitement terminé avec succès !")
