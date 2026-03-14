@@ -7,10 +7,10 @@ import zipfile
 from skimage.morphology import skeletonize
 
 # --- CONFIGURATION DE LA PAGE ---
-st.set_page_config(page_title="Convertisseur Image vers DXF PRO", layout="wide")
+st.set_page_config(page_title="Convertisseur Image vers DXF", layout="wide")
 
-st.title("🪄 Convertisseur Magique : Image ➡️ DXF (Version Pro)")
-st.write("Glissez-déposez vos images. Le moteur mathématique absolu garantit des lignes longues parfaitement tendues et des courbes fluides.")
+st.title("🪄 Convertisseur Magique : Image ➡️ DXF (Pro)")
+st.write("Le moteur d'ancrage virtuel garantit des lignes parfaitement droites et des virages ultra-fluides, sans aucune vaguelette.")
 
 # --- OPTIONS DU PANNEAU DE CONTRÔLE ---
 st.write("---")
@@ -26,24 +26,27 @@ with col1:
     mode_analyse = st.radio(
         "2. Méthode d'analyse de l'image :",
         options=[
-            "🎯 Trait central unique (Idéal Plans : force une ligne simple sans doublon)",
-            "⭕ Contours exacts (Idéal Dessins/Logos : garde l'épaisseur de votre coup de crayon)"
+            "🎯 Trait central unique (Force une ligne simple sans doublon)",
+            "⭕ Contours exacts (Garde l'épaisseur de votre coup de crayon)"
         ],
         index=0
     )
 
 with col2:
-    # Le curseur est maintenant basé sur la taille réelle des pixels !
     lissage = st.slider(
-        "Tolérance de lissage (en pixels)", 
+        "Tolérance de lissage", 
         min_value=0.5, max_value=15.0, value=2.0, step=0.5, 
-        help="Si fixé à 2.0, tout défaut ou ondulation de moins de 2 pixels est effacé. Parfait pour tendre les grandes lignes !"
+        help="Efface le bruit et les escaliers (pixels). Gardez autour de 2.0 ou 3.0."
     )
-    taille_min = st.slider(
-        "Ignorer la poussière", 
-        min_value=0, max_value=500, value=50, step=10, 
-        help="Efface les petits points indésirables."
+    
+    # NOUVEAU CURSEUR : Le secret pour les Splines
+    tension = st.slider(
+        "Tension des lignes droites (Ancrage Spline)", 
+        min_value=5.0, max_value=50.0, value=10.0, step=1.0, 
+        help="Plus la valeur est basse, plus on injecte de points alignés pour forcer la ligne à rester droite avant un virage. (Moyenne recommandée : 10)"
     )
+    
+    taille_min = st.slider("Ignorer la poussière", min_value=0, max_value=500, value=50, step=10)
 st.write("---")
 
 # --- ZONE DE TÉLÉCHARGEMENT ---
@@ -55,13 +58,13 @@ fichiers_uploades = st.file_uploader(
 
 # --- TRAITEMENT DES IMAGES ---
 if fichiers_uploades:
-    st.write("⏳ *Moteur haute précision en cours d'exécution...*")
+    st.write("⏳ *Moteur d'ancrage mathématique en cours de calcul...*")
     dxf_generes = {}
     barre_progression = st.progress(0)
     total_fichiers = len(fichiers_uploades)
 
     for index, fichier in enumerate(fichiers_uploades):
-        # 1. LIRE L'IMAGE (Gère la transparence PNG)
+        # 1. LIRE L'IMAGE (Transparence incluse)
         bytes_data = np.asarray(bytearray(fichier.read()), dtype=np.uint8)
         image = cv2.imdecode(bytes_data, cv2.IMREAD_UNCHANGED) 
         
@@ -78,7 +81,6 @@ if fichiers_uploades:
                 fond_blanc[:, :, couleur] = image[:, :, couleur] * alpha + fond_blanc[:, :, couleur] * (1 - alpha)
             image = fond_blanc 
 
-        # Conversion en niveaux de gris avec un très léger flou pour adoucir les pixels d'origine
         if len(image.shape) == 3:
             gris = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
@@ -127,12 +129,45 @@ if fichiers_uploades:
             if len(contour_propre) < 2:
                 continue
                 
-            # --- LE SECRET EST ICI : L'EPSILON ABSOLU ---
-            # Au lieu d'un pourcentage, on utilise la valeur directe en pixels du curseur (ex: 2.0)
-            # Cela éradique instantanément l'effet "escalier" sur les longues distances.
-            epsilon = float(lissage)
+            # ÉTAPE A : Le lissage absolu (enlève l'effet escalier)
+            contour_simplifie = cv2.approxPolyDP(contour_propre, float(lissage), contour_ferme)
+
+            # ÉTAPE B : L'ANCRAGE MATHÉMATIQUE (La solution à ton problème)
+            # Si on veut une Spline, on injecte des points pour la tendre
+            if "Splines" in type_trace:
+                points_denses = []
+                nb_points = len(contour_simplifie)
                 
-            contour_final = cv2.approxPolyDP(contour_propre, epsilon, contour_ferme)
+                for i in range(nb_points):
+                    p1 = contour_simplifie[i][0]
+                    
+                    if i == nb_points - 1:
+                        if not contour_ferme:
+                            points_denses.append([[p1[0], p1[1]]])
+                            break
+                        else:
+                            p2 = contour_simplifie[0][0] # On boucle
+                    else:
+                        p2 = contour_simplifie[i+1][0]
+                        
+                    points_denses.append([[p1[0], p1[1]]])
+                    
+                    # On calcule la distance de la ligne droite
+                    dist = np.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
+                    
+                    # Si la ligne droite est plus grande que la tension demandée...
+                    if dist > tension:
+                        # ... on injecte des points parfaits au milieu !
+                        nb_injections = int(dist / tension)
+                        for j in range(1, nb_injections):
+                            fraction = j / float(nb_injections)
+                            nx = p1[0] + (p2[0] - p1[0]) * fraction
+                            ny = p1[1] + (p2[1] - p1[1]) * fraction
+                            points_denses.append([[nx, ny]])
+                            
+                contour_final = np.array(points_denses, dtype=np.float32)
+            else:
+                contour_final = contour_simplifie # Pour les Polylignes, pas besoin d'ancrage
 
             # Préparation des coordonnées pour AutoCAD (Y inversé)
             points = [(float(p[0][0]), float(hauteur - p[0][1])) for p in contour_final]
@@ -141,7 +176,6 @@ if fichiers_uploades:
             if len(points) >= 2:
                 if "Splines" in type_trace and len(points) >= 4:
                     try:
-                        # La Spline sera maintenant tendue à l'extrême sur les lignes droites
                         espace_modele.add_spline(fit_points=points)
                     except Exception:
                         espace_modele.add_lwpolyline(points)
@@ -156,7 +190,7 @@ if fichiers_uploades:
         dxf_generes[nom_dxf] = flux_texte.getvalue()
         barre_progression.progress((index + 1) / total_fichiers)
 
-    st.success("✅ Fichiers générés avec une précision chirurgicale !")
+    st.success("✅ Fichiers ancrés et générés avec succès !")
 
     # --- TÉLÉCHARGEMENT ---
     if len(dxf_generes) == 1:
@@ -179,5 +213,6 @@ if fichiers_uploades:
             file_name="fichiers_convertis_dxf.zip",
             mime="application/zip"
         )
+
 
 
