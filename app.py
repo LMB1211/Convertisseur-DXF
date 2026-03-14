@@ -7,10 +7,10 @@ import zipfile
 from skimage.morphology import skeletonize
 
 # --- CONFIGURATION DE LA PAGE ---
-st.set_page_config(page_title="Convertisseur Image vers DXF", layout="wide")
+st.set_page_config(page_title="Convertisseur Image vers DXF PRO", layout="wide")
 
-st.title("🪄 Convertisseur Magique : Image ➡️ DXF")
-st.write("Glissez-déposez vos images. Les lignes droites restent droites, les courbes restent fluides !")
+st.title("🪄 Convertisseur Magique : Image ➡️ DXF (Version Pro)")
+st.write("Glissez-déposez vos images. Le moteur mathématique absolu garantit des lignes longues parfaitement tendues et des courbes fluides.")
 
 # --- OPTIONS DU PANNEAU DE CONTRÔLE ---
 st.write("---")
@@ -33,8 +33,17 @@ with col1:
     )
 
 with col2:
-    lissage = st.slider("Simplification des traits", min_value=1.0, max_value=10.0, value=2.0, step=0.5, help="Réduit le nombre de points. Gardez bas pour plus de détails.")
-    taille_min = st.slider("Ignorer la poussière", min_value=0, max_value=500, value=50, step=10, help="Efface les petits points indésirables.")
+    # Le curseur est maintenant basé sur la taille réelle des pixels !
+    lissage = st.slider(
+        "Tolérance de lissage (en pixels)", 
+        min_value=0.5, max_value=15.0, value=2.0, step=0.5, 
+        help="Si fixé à 2.0, tout défaut ou ondulation de moins de 2 pixels est effacé. Parfait pour tendre les grandes lignes !"
+    )
+    taille_min = st.slider(
+        "Ignorer la poussière", 
+        min_value=0, max_value=500, value=50, step=10, 
+        help="Efface les petits points indésirables."
+    )
 st.write("---")
 
 # --- ZONE DE TÉLÉCHARGEMENT ---
@@ -46,13 +55,13 @@ fichiers_uploades = st.file_uploader(
 
 # --- TRAITEMENT DES IMAGES ---
 if fichiers_uploades:
-    st.write("⏳ *Traitement en cours, un fer à repasser mathématique lisse vos traits...*")
+    st.write("⏳ *Moteur haute précision en cours d'exécution...*")
     dxf_generes = {}
     barre_progression = st.progress(0)
     total_fichiers = len(fichiers_uploades)
 
     for index, fichier in enumerate(fichiers_uploades):
-        # 1. LIRE L'IMAGE (Transparence incluse)
+        # 1. LIRE L'IMAGE (Gère la transparence PNG)
         bytes_data = np.asarray(bytearray(fichier.read()), dtype=np.uint8)
         image = cv2.imdecode(bytes_data, cv2.IMREAD_UNCHANGED) 
         
@@ -69,16 +78,18 @@ if fichiers_uploades:
                 fond_blanc[:, :, couleur] = image[:, :, couleur] * alpha + fond_blanc[:, :, couleur] * (1 - alpha)
             image = fond_blanc 
 
-        # Conversion en noir et blanc
+        # Conversion en niveaux de gris avec un très léger flou pour adoucir les pixels d'origine
         if len(image.shape) == 3:
             gris = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
             gris = image
+            
+        gris_adouci = cv2.GaussianBlur(gris, (3, 3), 0)
         
-        # 2. SÉPARATION FOND / TRAIT
-        _, binaire = cv2.threshold(gris, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        # 2. SEPARATION FOND / TRAIT
+        _, binaire = cv2.threshold(gris_adouci, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         
-        # 3. ANALYSE SELON LE CHOIX DE L'UTILISATEUR
+        # 3. ANALYSE SELON LE CHOIX
         if "Trait central" in mode_analyse:
             image_bool = binaire > 0
             squelette = skeletonize(image_bool)
@@ -116,28 +127,10 @@ if fichiers_uploades:
             if len(contour_propre) < 2:
                 continue
                 
-            # --- LE FER À REPASSER MATHÉMATIQUE (Lissage anti-vaguelettes) ---
-            # Transforme les escaliers de pixels en lignes droites parfaites
-            if len(contour_propre) > 4:
-                pts_flottants = contour_propre.astype(np.float32)
-                # On applique 4 passages de lissage pour un rendu parfait
-                for _ in range(4):
-                    temp = np.copy(pts_flottants)
-                    # Aligne chaque point entre son voisin de gauche et de droite
-                    temp[1:-1] = (pts_flottants[:-2] + pts_flottants[1:-1] + pts_flottants[2:]) / 3.0
-                    
-                    if contour_ferme: # Raccorde proprement le début et la fin
-                        temp[0] = (pts_flottants[-1] + pts_flottants[0] + pts_flottants[1]) / 3.0
-                        temp[-1] = (pts_flottants[-2] + pts_flottants[-1] + pts_flottants[0]) / 3.0
-                        
-                contour_propre = temp # On remplace l'escalier par la courbe lissée
-
-            # Extraction des points de repère importants
-            if "Splines" in type_trace:
-                # La division par 10 garde beaucoup de points d'ancrage pour forcer la Spline à rester tendue et droite
-                epsilon = (lissage / 10.0) * cv2.arcLength(contour_propre, contour_ferme) / 1000.0
-            else:
-                epsilon = lissage * cv2.arcLength(contour_propre, contour_ferme) / 1000.0
+            # --- LE SECRET EST ICI : L'EPSILON ABSOLU ---
+            # Au lieu d'un pourcentage, on utilise la valeur directe en pixels du curseur (ex: 2.0)
+            # Cela éradique instantanément l'effet "escalier" sur les longues distances.
+            epsilon = float(lissage)
                 
             contour_final = cv2.approxPolyDP(contour_propre, epsilon, contour_ferme)
 
@@ -146,8 +139,9 @@ if fichiers_uploades:
             
             # --- DESSIN FINAL ---
             if len(points) >= 2:
-                if "Splines" in type_trace and len(points) >= 3:
+                if "Splines" in type_trace and len(points) >= 4:
                     try:
+                        # La Spline sera maintenant tendue à l'extrême sur les lignes droites
                         espace_modele.add_spline(fit_points=points)
                     except Exception:
                         espace_modele.add_lwpolyline(points)
@@ -162,7 +156,7 @@ if fichiers_uploades:
         dxf_generes[nom_dxf] = flux_texte.getvalue()
         barre_progression.progress((index + 1) / total_fichiers)
 
-    st.success("✅ Fichiers lissés et générés avec succès !")
+    st.success("✅ Fichiers générés avec une précision chirurgicale !")
 
     # --- TÉLÉCHARGEMENT ---
     if len(dxf_generes) == 1:
